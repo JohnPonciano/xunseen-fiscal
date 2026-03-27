@@ -5,14 +5,21 @@
 
 portal:
   url: "https://www.nfse.gov.br/EmissorNacional"
-  headless: false  # false = abre o navegador visivelmente (recomendado para 2FA do gov.br)
-  slow_mo: 100     # delay em ms entre ações (aumentar se o portal estiver lento)
+  slow_mo: 80      # delay em ms entre ações (aumentar se o portal estiver lento)
   timeout: 30000   # timeout padrão em ms
+  # Chaves onde o token será injetado no sessionStorage.
+  # O portal usa uma dessas — deixe as todas para garantir.
+  token_storage_keys:
+    - "token"
+    - "access_token"
+    - "authToken"
+    - "auth_token"
+    - "nfse_token"
+    - "TOKEN"
 
 emitente:
   nome: "JONATHAN HENRIQUE PONCIANO SILVA"
   cnpj: "59.458.548/0001-22"
-  cpf: "595.458.548-00"  # CPF para login no gov.br
 
 tomador:
   cnpj: "42.023.329/0001-18"

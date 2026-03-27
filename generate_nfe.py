@@ -3,10 +3,17 @@
 Auto Invoice Generator - NFS-e Emissor Nacional
 Automatiza a emissão mensal de NFS-e no portal nfse.gov.br/EmissorNacional
 
+Como funciona:
+  1. Você loga manualmente no portal UMA VEZ
+  2. Abre o DevTools (F12) > Application > Session Storage > nfse.gov.br
+  3. Copia o valor do token (ex: chave "token" ou "access_token")
+  4. Cola no .env como NFSE_ACCESS_TOKEN=...
+  5. Roda o script — ele injeta o token e preenche tudo sozinho
+
 Uso:
-    python generate_nfe.py                  # usa a competência do mês atual
-    python generate_nfe.py --mes 2 --ano 2026  # competência específica
-    python generate_nfe.py --dry-run        # mostra o que seria preenchido sem emitir
+    python generate_nfe.py                     # competência do mês atual
+    python generate_nfe.py --mes 3 --ano 2026  # competência específica
+    python generate_nfe.py --dry-run           # preenche mas não emite
 """
 
 import asyncio
@@ -41,7 +48,6 @@ def load_config() -> dict:
 
 
 def build_descricao(config: dict, competencia: date) -> str:
-    """Monta a descrição do serviço com o período correto."""
     mes_nome = MONTHS_PT[competencia.month]
     ano = competencia.year
     ultimo_dia = calendar.monthrange(ano, competencia.month)[1]
@@ -52,8 +58,7 @@ def build_descricao(config: dict, competencia: date) -> str:
     valor = config["faturamento"]["valor"]
     valor_formatado = f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-    template = config["servico"]["descricao_template"]
-    return template.format(
+    return config["servico"]["descricao_template"].format(
         mes=mes_nome,
         ano=ano,
         ultimo_dia=ultimo_dia,
@@ -63,208 +68,196 @@ def build_descricao(config: dict, competencia: date) -> str:
 
 
 def print_preview(config: dict, competencia: date, descricao: str) -> None:
-    """Exibe um resumo do que será preenchido na NFS-e."""
     table = Table(box=box.ROUNDED, show_header=False, padding=(0, 1))
     table.add_column("Campo", style="bold cyan", width=28)
     table.add_column("Valor", style="white")
 
-    mes_ano = f"{MONTHS_PT[competencia.month]}/{competencia.year}"
     valor = config["faturamento"]["valor"]
+    valor_fmt = f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
-    table.add_row("Competência", mes_ano)
+    table.add_row("Competência", f"{MONTHS_PT[competencia.month]}/{competencia.year}")
     table.add_row("Emitente", config["emitente"]["nome"])
     table.add_row("CNPJ Emitente", config["emitente"]["cnpj"])
     table.add_row("Tomador", config["tomador"]["nome"])
     table.add_row("CNPJ Tomador", config["tomador"]["cnpj"])
     table.add_row("Código Tributação", config["servico"]["codigo_tributacao_nacional"])
-    table.add_row("Valor", f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+    table.add_row("Valor", valor_fmt)
     table.add_row("Descrição", descricao)
 
     console.print(Panel(table, title="[bold green]NFS-e a ser emitida[/bold green]", border_style="green"))
 
 
-async def login_govbr(page, cpf: str, senha: str) -> None:
-    """Realiza login no gov.br."""
-    console.print("[cyan]Iniciando login no gov.br...[/cyan]")
+async def injetar_token(page, token: str, config: dict) -> None:
+    """
+    Navega para o portal, injeta o token no sessionStorage e recarrega.
+    Injeta sob todas as chaves comuns — o portal vai usar a que conhece.
+    """
+    url = config["portal"]["url"]
+    console.print(f"[cyan]Abrindo {url}...[/cyan]")
+    await page.goto(url, wait_until="domcontentloaded", timeout=config["portal"]["timeout"])
 
-    # Campo CPF
-    await page.wait_for_selector('input[name="accountId"], input[id="accountId"], input[placeholder*="CPF"]', timeout=15000)
-    cpf_limpo = cpf.replace(".", "").replace("-", "")
-    await page.fill('input[name="accountId"], input[id="accountId"], input[placeholder*="CPF"]', cpf_limpo)
-    await page.click('button[type="submit"], button:has-text("Continuar"), button:has-text("Próximo")')
+    # Chaves comuns usadas por portais React/Angular do gov.br
+    chaves = config["portal"].get("token_storage_keys", [
+        "token",
+        "access_token",
+        "authToken",
+        "auth_token",
+        "nfse_token",
+        "TOKEN",
+    ])
 
-    # Campo senha
-    await page.wait_for_selector('input[type="password"]', timeout=10000)
-    await page.fill('input[type="password"]', senha)
-    await page.click('button[type="submit"], button:has-text("Entrar"), button:has-text("Acessar")')
+    js_injecao = "\n".join(
+        f'sessionStorage.setItem({key!r}, {token!r});'
+        for key in chaves
+    )
+    await page.evaluate(js_injecao)
+    console.print(f"[green]✓ Token injetado no sessionStorage ({len(chaves)} chaves).[/green]")
 
-    # Aguarda possível 2FA (QR code, SMS, app gov.br)
-    console.print("[yellow]Se aparecer tela de verificação em 2 etapas, autorize no app gov.br ou insira o código.[/yellow]")
+    # Recarrega para o portal ler o token
+    await page.reload(wait_until="networkidle", timeout=config["portal"]["timeout"])
 
-    # Espera o redirecionamento de volta ao Emissor Nacional
-    try:
-        await page.wait_for_url("**/EmissorNacional**", timeout=60000)
-        console.print("[green]✓ Login realizado com sucesso![/green]")
-    except PlaywrightTimeout:
-        # Verifica se ainda está em tela de 2FA
-        current_url = page.url
-        if "sso.acesso.gov.br" in current_url or "acesso.gov.br" in current_url:
-            console.print("[yellow]Aguardando autenticação adicional (2FA)... [60s][/yellow]")
-            await page.wait_for_url("**/EmissorNacional**", timeout=120000)
-            console.print("[green]✓ Login realizado com sucesso![/green]")
-        else:
-            raise
+    # Confirma que não foi redirecionado para login
+    await asyncio.sleep(1)
+    current_url = page.url
+    if "login" in current_url.lower() or "sso.acesso" in current_url.lower():
+        console.print(
+            "[bold red]O portal redirecionou para login — token inválido ou expirado.[/bold red]\n"
+            "[yellow]Faça login manualmente, copie o token do DevTools (F12 > Application > Session Storage)\n"
+            "e atualize NFSE_ACCESS_TOKEN no arquivo .env[/yellow]"
+        )
+        await asyncio.sleep(30)  # mantém aberto para o usuário ver
+        sys.exit(1)
+
+    console.print("[green]✓ Portal autenticado com sucesso![/green]")
 
 
-async def navegar_para_emitir(page) -> None:
-    """Navega até o formulário de emissão de NFS-e."""
+async def navegar_para_emitir(page, config: dict) -> None:
     console.print("[cyan]Navegando para emissão de NFS-e...[/cyan]")
-
-    # Aguarda o dashboard carregar
     await page.wait_for_load_state("networkidle", timeout=15000)
 
-    # Clica em "Emitir NFS-e" ou botão equivalente
     emitir_selectors = [
         'a:has-text("Emitir NFS-e")',
         'button:has-text("Emitir NFS-e")',
         'a:has-text("Nova NFS-e")',
         'button:has-text("Nova NFS-e")',
+        'a:has-text("Emitir")',
+        'button:has-text("Emitir")',
         '[data-testid="emitir-nfse"]',
     ]
     for selector in emitir_selectors:
         try:
             await page.click(selector, timeout=3000)
-            break
+            await page.wait_for_load_state("networkidle", timeout=15000)
+            console.print("[green]✓ Formulário de emissão aberto.[/green]")
+            return
         except PlaywrightTimeout:
             continue
-    else:
-        raise RuntimeError(
-            "Não foi possível encontrar o botão 'Emitir NFS-e'. "
-            "O layout do portal pode ter mudado — verifique o seletor em navegar_para_emitir()."
-        )
 
-    await page.wait_for_load_state("networkidle", timeout=15000)
-    console.print("[green]✓ Formulário de emissão aberto.[/green]")
+    raise RuntimeError(
+        "Não encontrou o botão 'Emitir NFS-e'.\n"
+        "O layout do portal pode ter mudado — abra o portal manualmente e ajuste\n"
+        "os seletores em navegar_para_emitir() no script."
+    )
 
 
 async def preencher_competencia(page, competencia: date) -> None:
-    """Preenche o campo de competência (mês/ano)."""
     console.print(f"[cyan]Preenchendo competência: {competencia.month:02d}/{competencia.year}...[/cyan]")
 
-    competencia_str = f"{competencia.month:02d}/{competencia.year}"
-
-    selectors = [
+    # Tenta campo único MM/AAAA
+    for sel in [
         'input[name="competencia"]',
-        'input[placeholder*="competência"]',
-        'input[placeholder*="Competência"]',
-        'input[aria-label*="competência"]',
-        'input[aria-label*="Competência"]',
-    ]
-    for selector in selectors:
+        'input[placeholder*="ompetência"]',
+        'input[aria-label*="ompetência"]',
+    ]:
         try:
-            await page.fill(selector, competencia_str, timeout=3000)
+            await page.fill(sel, f"{competencia.month:02d}/{competencia.year}", timeout=3000)
             console.print("[green]✓ Competência preenchida.[/green]")
             return
         except PlaywrightTimeout:
             continue
 
-    # Fallback: tenta encontrar campos de mês e ano separados
+    # Fallback: campos separados de mês e ano
     try:
-        await page.select_option('select[name="mes"], select[aria-label*="mês"], select[aria-label*="Mês"]', str(competencia.month), timeout=3000)
-        await page.select_option('select[name="ano"], select[aria-label*="ano"], select[aria-label*="Ano"]', str(competencia.year), timeout=3000)
+        await page.select_option('select[name="mes"], select[aria-label*="ês"]', str(competencia.month), timeout=3000)
+        await page.select_option('select[name="ano"], select[aria-label*="no"]', str(competencia.year), timeout=3000)
         console.print("[green]✓ Competência preenchida (mês/ano separados).[/green]")
         return
     except PlaywrightTimeout:
         pass
 
-    console.print("[yellow]⚠ Não encontrou campo de competência automaticamente. Verifique manualmente.[/yellow]")
+    console.print("[yellow]⚠ Campo de competência não encontrado automaticamente — verifique o formulário.[/yellow]")
 
 
 async def preencher_tomador(page, config: dict) -> None:
-    """Preenche os dados do tomador do serviço."""
-    console.print("[cyan]Preenchendo dados do tomador...[/cyan]")
+    console.print("[cyan]Preenchendo CNPJ do tomador...[/cyan]")
 
-    cnpj = config["tomador"]["cnpj"]
-    cnpj_limpo = cnpj.replace(".", "").replace("/", "").replace("-", "")
+    cnpj = config["tomador"]["cnpj"].replace(".", "").replace("/", "").replace("-", "")
 
-    selectors_cnpj = [
+    for sel in [
         'input[name="cnpjTomador"]',
         'input[name="tomadorCnpj"]',
-        'input[placeholder*="CNPJ do tomador"]',
-        'input[placeholder*="CNPJ/CPF"]',
+        'input[placeholder*="CNPJ"]',
         'input[aria-label*="CNPJ"]',
-    ]
-    for selector in selectors_cnpj:
+        'input[aria-label*="omador"]',
+    ]:
         try:
-            await page.fill(selector, cnpj_limpo, timeout=3000)
-            await page.press(selector, "Tab")  # dispara busca automática pelo CNPJ
-            await page.wait_for_timeout(1500)   # aguarda preenchimento automático
+            await page.fill(sel, cnpj, timeout=3000)
+            await page.press(sel, "Tab")
+            await page.wait_for_timeout(1500)  # aguarda preenchimento automático pelo portal
             console.print("[green]✓ CNPJ do tomador preenchido.[/green]")
-            break
+            return
         except PlaywrightTimeout:
             continue
 
-    # Preenche email se configurado
-    if config["tomador"].get("email"):
-        try:
-            await page.fill('input[name="emailTomador"], input[placeholder*="e-mail"]', config["tomador"]["email"], timeout=3000)
-        except PlaywrightTimeout:
-            pass
+    console.print("[yellow]⚠ Campo de CNPJ do tomador não encontrado automaticamente.[/yellow]")
 
 
 async def preencher_servico(page, config: dict, descricao: str) -> None:
-    """Preenche o bloco de serviço: código, descrição e valor."""
     console.print("[cyan]Preenchendo dados do serviço...[/cyan]")
 
     codigo = config["servico"]["codigo_tributacao_nacional"]
-    valor = config["faturamento"]["valor"]
-    valor_str = f"{valor:.2f}".replace(".", ",")
+    valor_str = f"{config['faturamento']['valor']:.2f}".replace(".", ",")
 
-    # Código de tributação nacional
-    selectors_codigo = [
+    # Código de tributação
+    for sel in [
         'input[name="codigoTributacaoNacional"]',
         'input[name="codigoServico"]',
-        'input[placeholder*="código de tributação"]',
-        'input[placeholder*="Código de Tributação"]',
-        'input[aria-label*="Código de Tributação"]',
-    ]
-    for selector in selectors_codigo:
+        'input[placeholder*="ributação"]',
+        'input[aria-label*="ributação"]',
+        'input[aria-label*="Serviço"]',
+    ]:
         try:
-            await page.fill(selector, codigo, timeout=3000)
-            await page.press(selector, "Tab")
+            await page.fill(sel, codigo, timeout=3000)
+            await page.press(sel, "Tab")
             await page.wait_for_timeout(1000)
             console.print("[green]✓ Código de tributação preenchido.[/green]")
             break
         except PlaywrightTimeout:
             continue
 
-    # Descrição do serviço
-    selectors_desc = [
+    # Descrição
+    for sel in [
         'textarea[name="descricaoServico"]',
         'textarea[name="descricao"]',
-        'textarea[placeholder*="descrição"]',
-        'textarea[aria-label*="descrição"]',
-        'textarea[aria-label*="Descrição"]',
-    ]
-    for selector in selectors_desc:
+        'textarea[placeholder*="escrição"]',
+        'textarea[aria-label*="escrição"]',
+    ]:
         try:
-            await page.fill(selector, descricao, timeout=3000)
+            await page.fill(sel, descricao, timeout=3000)
             console.print("[green]✓ Descrição preenchida.[/green]")
             break
         except PlaywrightTimeout:
             continue
 
-    # Valor do serviço
-    selectors_valor = [
+    # Valor
+    for sel in [
         'input[name="valorServico"]',
         'input[name="valor"]',
-        'input[placeholder*="valor"]',
-        'input[placeholder*="Valor"]',
-        'input[aria-label*="Valor"]',
-    ]
-    for selector in selectors_valor:
+        'input[placeholder*="alor"]',
+        'input[aria-label*="alor"]',
+    ]:
         try:
-            await page.fill(selector, valor_str, timeout=3000)
+            await page.fill(sel, valor_str, timeout=3000)
             console.print("[green]✓ Valor preenchido.[/green]")
             break
         except PlaywrightTimeout:
@@ -272,112 +265,101 @@ async def preencher_servico(page, config: dict, descricao: str) -> None:
 
 
 async def confirmar_e_emitir(page, dry_run: bool) -> None:
-    """Confirma a emissão da NFS-e."""
     if dry_run:
         console.print("[yellow]--dry-run ativo: formulário preenchido mas NÃO será submetido.[/yellow]")
-        console.print("[yellow]Pressione Ctrl+C para encerrar ou feche o navegador.[/yellow]")
-        await asyncio.sleep(60)
+        console.print("[yellow]O navegador ficará aberto. Pressione Ctrl+C para encerrar.[/yellow]")
+        await asyncio.Event().wait()  # espera indefinidamente até Ctrl+C
         return
 
     console.print("[cyan]Submetendo NFS-e...[/cyan]")
 
-    submit_selectors = [
+    for sel in [
         'button[type="submit"]:has-text("Emitir")',
         'button:has-text("Emitir NFS-e")',
         'button:has-text("Confirmar")',
         'button:has-text("Salvar e Emitir")',
         '[data-testid="submit-nfse"]',
-    ]
-    for selector in submit_selectors:
+    ]:
         try:
-            await page.click(selector, timeout=3000)
+            await page.click(sel, timeout=3000)
             break
         except PlaywrightTimeout:
             continue
     else:
-        raise RuntimeError(
-            "Não encontrou o botão de submissão. "
-            "Verifique o seletor em confirmar_e_emitir()."
-        )
+        raise RuntimeError("Não encontrou o botão de submissão — ajuste os seletores em confirmar_e_emitir().")
 
     # Aguarda confirmação de sucesso
-    sucesso_selectors = [
+    for sel in [
         'text="NFS-e emitida com sucesso"',
         'text="Nota Fiscal emitida"',
         '[class*="success"]',
         '[class*="sucesso"]',
-    ]
-    for selector in sucesso_selectors:
+        '[role="alert"]',
+    ]:
         try:
-            await page.wait_for_selector(selector, timeout=15000)
+            await page.wait_for_selector(sel, timeout=15000)
             console.print("[bold green]✓ NFS-e emitida com sucesso![/bold green]")
             return
         except PlaywrightTimeout:
             continue
 
-    console.print("[yellow]⚠ Submissão realizada, mas não foi possível confirmar o sucesso automaticamente. Verifique o portal.[/yellow]")
+    console.print("[yellow]⚠ Submissão realizada — verifique o portal para confirmar a emissão.[/yellow]")
 
 
 async def run(competencia: date, dry_run: bool, config: dict) -> None:
-    cpf = os.getenv("GOVBR_CPF") or config["emitente"].get("cpf", "")
-    senha = os.getenv("GOVBR_SENHA", "")
-
-    if not cpf or not senha:
-        console.print("[red]Erro: defina GOVBR_CPF e GOVBR_SENHA no arquivo .env[/red]")
+    token = os.getenv("NFSE_ACCESS_TOKEN", "").strip()
+    if not token:
+        console.print(
+            "[bold red]NFSE_ACCESS_TOKEN não definido.[/bold red]\n"
+            "[yellow]1. Acesse nfse.gov.br/EmissorNacional e faça login manualmente\n"
+            "2. Abra DevTools (F12) > Application > Session Storage > nfse.gov.br\n"
+            "3. Copie o valor do token\n"
+            "4. Cole no arquivo .env como: NFSE_ACCESS_TOKEN=seu_token_aqui[/yellow]"
+        )
         sys.exit(1)
 
     descricao = build_descricao(config, competencia)
     print_preview(config, competencia, descricao)
 
-    if dry_run:
-        console.print("[yellow]Modo dry-run: abrindo o portal para visualização.[/yellow]")
-
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
-            headless=config["portal"]["headless"],
-            slow_mo=config["portal"]["slow_mo"],
+            headless=False,  # sempre visível — portal gov.br precisa de navegador real
+            slow_mo=config["portal"].get("slow_mo", 80),
         )
         context = await browser.new_context(viewport={"width": 1280, "height": 900})
         page = await context.new_page()
 
         try:
-            console.print(f"[cyan]Abrindo {config['portal']['url']}...[/cyan]")
-            await page.goto(config["portal"]["url"], timeout=config["portal"]["timeout"])
-
-            await login_govbr(page, cpf, senha)
-            await navegar_para_emitir(page)
+            await injetar_token(page, token, config)
+            await navegar_para_emitir(page, config)
             await preencher_competencia(page, competencia)
             await preencher_tomador(page, config)
             await preencher_servico(page, config, descricao)
             await confirmar_e_emitir(page, dry_run)
 
+        except KeyboardInterrupt:
+            console.print("\n[yellow]Encerrado pelo usuário.[/yellow]")
         except Exception as exc:
-            console.print(f"[bold red]Erro durante a automação:[/bold red] {exc}")
-            console.print("[yellow]O navegador permanecerá aberto por 2 minutos para inspeção.[/yellow]")
+            console.print(f"[bold red]Erro:[/bold red] {exc}")
+            console.print("[yellow]Navegador ficará aberto por 2 minutos para inspeção.[/yellow]")
             await asyncio.sleep(120)
             raise
         finally:
-            if not dry_run:
-                await browser.close()
+            await browser.close()
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Gera automaticamente a NFS-e mensal no Emissor Nacional (nfse.gov.br)"
+        description="Gera NFS-e mensal automaticamente no Emissor Nacional (nfse.gov.br)"
     )
     parser.add_argument("--mes", type=int, help="Mês da competência (1-12). Padrão: mês atual.")
     parser.add_argument("--ano", type=int, help="Ano da competência. Padrão: ano atual.")
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Preenche o formulário mas não submete a nota.",
-    )
+    parser.add_argument("--dry-run", action="store_true", help="Preenche o formulário mas não submete.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-
     today = date.today()
     mes = args.mes or today.month
     ano = args.ano or today.year
