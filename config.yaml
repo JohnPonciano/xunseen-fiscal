@@ -1,0 +1,35 @@
+# ============================================================
+# Configuração do Gerador Automático de NFS-e
+# Emissor Nacional - https://www.nfse.gov.br/EmissorNacional
+# ============================================================
+
+portal:
+  url: "https://www.nfse.gov.br/EmissorNacional"
+  headless: false  # false = abre o navegador visivelmente (recomendado para 2FA do gov.br)
+  slow_mo: 100     # delay em ms entre ações (aumentar se o portal estiver lento)
+  timeout: 30000   # timeout padrão em ms
+
+emitente:
+  nome: "JONATHAN HENRIQUE PONCIANO SILVA"
+  cnpj: "59.458.548/0001-22"
+  cpf: "595.458.548-00"  # CPF para login no gov.br
+
+tomador:
+  cnpj: "42.023.329/0001-18"
+  nome: "STALSE ANALYTICS CONSULTORIA DE DADOS DIGITAIS LTDA"
+  email: ""  # opcional
+
+servico:
+  codigo_tributacao_nacional: "01.02.01"
+  # Descrição usa variáveis: {mes}, {ano}, {ultimo_dia}, {valor_formatado}, {data_pagamento}
+  descricao_template: |
+    Período: 01 de {mes} de {ano} até {ultimo_dia} de {mes} de {ano}.
+    Valor total da NF: R$ {valor_formatado}
+    Data prevista de pagamento: {data_pagamento}
+  natureza_operacao: "1"  # 1 = Tributação no Município
+  local_prestacao: "Itu - SP"
+
+faturamento:
+  valor: 5500.00          # Valor fixo mensal em R$
+  # dia_pagamento: dia do mês seguinte para o pagamento esperado
+  dia_pagamento: 5
